@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MCP Feature Store - SSE Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        h1 { color: #569cd6; }
+        .controls {
+            background: #2d2d30;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        input, button {
+            padding: 8px;
+            margin: 5px;
+            background: #3c3c3c;
+            color: #cccccc;
+            border: 1px solid #555;
+            border-radius: 3px;
+        }
+        button:hover {
+            background: #4c4c4c;
+            cursor: pointer;
+        }
+        #events {
+            background: #2d2d30;
+            padding: 15px;
+            border-radius: 5px;
+            height: 400px;
+            overflow-y: auto;
+        }
+        .event {
+            margin: 5px 0;
+            padding: 5px;
+            border-left: 3px solid #569cd6;
+            background: #252526;
+        }
+        .event-type {
+            color: #4ec9b0;
+            font-weight: bold;
+        }
+        .error { border-left-color: #f48771; }
+        .complete { border-left-color: #6a9955; }
+        .status {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 3px;
+            margin-left: 10px;
+        }
+        .connected { background: #6a9955; }
+        .disconnected { background: #f48771; }
+    </style>
+</head>
+<body>
+    <h1>MCP Feature Store - SSE Streaming Test</h1>
+    
+    <div class="controls">
+        <input type="text" id="url" placeholder="Enter file path or URL" value="/home/josh/Projects/mcp-feature-store/test/test-image.png" style="width: 60%">
+        <button onclick="startExtraction()">Start Extraction</button>
+        <button onclick="stopStream()">Stop</button>
+        <button onclick="clearEvents()">Clear</button>
+        <span id="status" class="status disconnected">Disconnected</span>
+    </div>
+
+    <div id="events"></div>
+
+    <script>
+        let eventSource = null;
+        const eventsDiv = document.getElementById('events');
+        const statusSpan = document.getElementById('status');
+
+        function addEvent(type, data) {
+            const eventDiv = document.createElement('div');
+            eventDiv.className = 'event';
+            if (type === 'error') eventDiv.className += ' error';
+            if (type === 'complete') eventDiv.className += ' complete';
+            
+            const timestamp = new Date().toLocaleTimeString();
+            eventDiv.innerHTML = `
+                <span class="event-type">[${timestamp}] ${type}:</span>
+                <pre>${JSON.stringify(data, null, 2)}</pre>
+            `;
+            
+            eventsDiv.appendChild(eventDiv);
+            eventsDiv.scrollTop = eventsDiv.scrollHeight;
+        }
+
+        async function startExtraction() {
+            stopStream();
+            
+            const url = document.getElementById('url').value;
+            if (!url) {
+                alert('Please enter a file path or URL');
+                return;
+            }
+
+            try {
+                // Use POST /extract with stream=true
+                const response = await fetch('http://localhost:8080/extract', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        url: url,
+                        stream: true,
+                        ttl: 3600
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                statusSpan.textContent = 'Connected';
+                statusSpan.className = 'status connected';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.startsWith('event:')) {
+                            const eventType = line.substring(6).trim();
+                            continue;
+                        }
+                        if (line.startsWith('data:')) {
+                            try {
+                                const data = JSON.parse(line.substring(5).trim());
+                                addEvent(data.type || 'message', data);
+                            } catch (e) {
+                                // Ignore parse errors
+                            }
+                        }
+                    }
+                }
+
+            } catch (error) {
+                addEvent('error', { message: error.message });
+                statusSpan.textContent = 'Error';
+                statusSpan.className = 'status disconnected';
+            }
+        }
+
+        function stopStream() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            statusSpan.textContent = 'Disconnected';
+            statusSpan.className = 'status disconnected';
+        }
+
+        function clearEvents() {
+            eventsDiv.innerHTML = '';
+        }
+
+        // Alternative: Use EventSource for GET endpoint
+        function startEventSource() {
+            const url = document.getElementById('url').value;
+            if (!url) {
+                alert('Please enter a file path or URL');
+                return;
+            }
+
+            stopStream();
+            
+            const encodedUrl = encodeURIComponent(url);
+            eventSource = new EventSource(`http://localhost:8080/stream/${encodedUrl}`);
+            
+            eventSource.onopen = () => {
+                statusSpan.textContent = 'Connected';
+                statusSpan.className = 'status connected';
+            };
+
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    addEvent('message', data);
+                } catch (e) {
+                    addEvent('message', { raw: event.data });
+                }
+            };
+
+            eventSource.addEventListener('feature_update', (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    addEvent('feature_update', data);
+                } catch (e) {
+                    console.error('Parse error:', e);
+                }
+            });
+
+            eventSource.addEventListener('complete', (event) => {
+                const data = JSON.parse(event.data);
+                addEvent('complete', data);
+                stopStream();
+            });
+
+            eventSource.onerror = (error) => {
+                addEvent('error', { message: 'Connection lost' });
+                statusSpan.textContent = 'Disconnected';
+                statusSpan.className = 'status disconnected';
+            };
+        }
+    </script>
+</body>
+</html>

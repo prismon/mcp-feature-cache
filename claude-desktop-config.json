@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mcp-feature-store": {
+      "command": "npx",
+      "args": ["tsx", "/home/josh/Projects/mcp-feature-store/src/index.ts"],
+      "env": {
+        "DATABASE_PATH": "/home/josh/Projects/mcp-feature-store/data/features.db",
+        "LOG_LEVEL": "info"
+      }
+    }
+  }
+}
