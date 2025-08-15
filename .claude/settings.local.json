@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "Bash(npm run test:smoke:*)",
+      "Bash(npm update:*)",
+      "Bash(curl:*)",
+      "Bash(npm install:*)",
+      "Bash(pkill:*)",
+      "Bash(killall:*)",
+      "Bash(npm run:*)",
+      "Bash(rm:*)",
+      "Bash(grep:*)",
+      "Bash(mv:*)"
+    ],
+    "deny": [],
+    "defaultMode": "acceptEdits"
+  }
+}

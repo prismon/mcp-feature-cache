@@ -200,8 +200,16 @@ export class DirectFeatureOrchestrator {
   private async extractImageFeatures(resource: Resource & { content: Buffer }, ttl: number): Promise<Feature[]> {
     const features: Feature[] = [];
     const buffer = resource.content;
+    
+    // Generate a unique resource ID from the URL or checksum
+    const resourceId = resource.checksum?.substring(0, 16) || 
+                      resource.url.split('/').pop()?.replace(/\.[^/.]+$/, '') || 
+                      uuidv4();
+    const serverUrl = process.env.SERVER_URL || `http://localhost:${process.env.PORT || 8080}`;
 
     try {
+      logger.trace('Extracting image features', { url: resource.url, resourceId });
+      
       // Get image metadata
       const metadata = await sharp(buffer).metadata();
       
@@ -233,42 +241,96 @@ export class DirectFeatureOrchestrator {
 
       const now = Math.floor(Date.now() / 1000);
 
+      // Store thumbnails in database but return URLs
+      const thumbnailFeatures = [
+        {
+          key: 'image.thumbnail_small',
+          buffer: thumbnailSmall,
+          dimensions: '150x150',
+          url: `${serverUrl}/thumbnails/${resourceId}/small`
+        },
+        {
+          key: 'image.thumbnail_medium',
+          buffer: thumbnailMedium,
+          dimensions: '400x400',
+          url: `${serverUrl}/thumbnails/${resourceId}/medium`
+        },
+        {
+          key: 'image.thumbnail_large',
+          buffer: thumbnailLarge,
+          dimensions: '1920x1080',
+          url: `${serverUrl}/thumbnails/${resourceId}/large`
+        }
+      ];
+      
+      // Store actual image data in database
+      for (const thumb of thumbnailFeatures) {
+        await this.db.storeFeatures(resource.url, [{
+          key: thumb.key,
+          value: thumb.buffer.toString('base64'),
+          type: FeatureType.BINARY,
+          ttl,
+          extractorTool: 'built-in',
+          metadata: { 
+            dimensions: thumb.dimensions, 
+            format: 'png',
+            resourceId
+          }
+        }]);
+      }
+      
+      // Return features with URLs instead of inline data
       features.push(
         {
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'image.thumbnail.small',
-          value: thumbnailSmall.toString('base64'),
-          valueType: FeatureType.BINARY,
+          value: `${serverUrl}/thumbnails/${resourceId}/small`,
+          valueType: FeatureType.TEXT,
           generatedAt: now,
           ttl,
           expiresAt: now + ttl,
           extractorTool: 'built-in',
-          metadata: { dimensions: '150x150', format: 'png' }
+          metadata: { 
+            dimensions: '150x150', 
+            format: 'png',
+            mediaType: 'url',
+            resourceId
+          }
         },
         {
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'image.thumbnail.medium',
-          value: thumbnailMedium.toString('base64'),
-          valueType: FeatureType.BINARY,
+          value: `${serverUrl}/thumbnails/${resourceId}/medium`,
+          valueType: FeatureType.TEXT,
           generatedAt: now,
           ttl,
           expiresAt: now + ttl,
           extractorTool: 'built-in',
-          metadata: { dimensions: '400x400', format: 'png' }
+          metadata: { 
+            dimensions: '400x400', 
+            format: 'png',
+            mediaType: 'url',
+            resourceId
+          }
         },
         {
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'image.thumbnail.large',
-          value: thumbnailLarge.toString('base64'),
-          valueType: FeatureType.BINARY,
+          value: `${serverUrl}/thumbnails/${resourceId}/large`,
+          valueType: FeatureType.TEXT,
           generatedAt: now,
           ttl,
           expiresAt: now + ttl,
           extractorTool: 'built-in',
-          metadata: { dimensions: '1920x1080', format: 'png' }
+          metadata: { 
+            dimensions: '1920x1080', 
+            format: 'png',
+            mediaType: 'url',
+            resourceId
+          }
         },
         {
           id: uuidv4(),
@@ -308,7 +370,11 @@ export class DirectFeatureOrchestrator {
         }
       );
 
-      logger.info(`Extracted ${features.length} image features from ${resource.url}`);
+      logger.info(`Extracted ${features.length} image features from ${resource.url}`, {
+        resourceId,
+        featureCount: features.length,
+        thumbnailUrls: thumbnailFeatures.map(t => t.url)
+      });
     } catch (error: any) {
       logger.error('Image extraction failed:', error);
       throw error;
@@ -320,6 +386,12 @@ export class DirectFeatureOrchestrator {
   private async extractVideoFeatures(resource: Resource & { content: Buffer }, ttl: number): Promise<Feature[]> {
     const features: Feature[] = [];
     
+    // Generate resource ID
+    const resourceId = resource.checksum?.substring(0, 16) || 
+                      resource.url.split('/').pop()?.replace(/\.[^/.]+$/, '') || 
+                      uuidv4();
+    const serverUrl = process.env.SERVER_URL || `http://localhost:${process.env.PORT || 8080}`;
+    
     // Check if ffmpeg is available
     try {
       await execAsync('ffmpeg -version');
@@ -328,8 +400,11 @@ export class DirectFeatureOrchestrator {
       return features;
     }
 
+    logger.trace('Extracting video features', { url: resource.url, resourceId });
+    
     // Save video to temp file
     const tempVideoPath = join(this.tempDir, `${uuidv4()}.video`);
+    const snapshots: Array<{ percentage: number; buffer: Buffer; url: string }> = [];
     
     try {
       await writeFile(tempVideoPath, resource.content);
@@ -350,31 +425,66 @@ export class DirectFeatureOrchestrator {
       const width = videoStream.width || 0;
       const height = videoStream.height || 0;
 
-      // Extract frame from middle of video
-      const middleTimestamp = duration / 2;
-      const thumbnailPath = join(this.tempDir, `${uuidv4()}.png`);
-      
-      await execAsync(
-        `ffmpeg -ss ${middleTimestamp} -i "${tempVideoPath}" -vframes 1 -vf "scale='min(400,iw)':'min(400,ih)':force_original_aspect_ratio=decrease" -f image2 "${thumbnailPath}" -y`
-      );
-
-      const thumbnailBuffer = await sharp(thumbnailPath).png().toBuffer();
-
       const now = Math.floor(Date.now() / 1000);
 
-      features.push(
-        {
+      // Extract snapshots at 10% intervals (0%, 10%, 20%, ..., 90%)
+      for (let percentage = 0; percentage <= 90; percentage += 10) {
+        const timestamp = (duration * percentage) / 100;
+        const snapshotPath = join(this.tempDir, `${uuidv4()}.png`);
+        
+        logger.trace(`Extracting video snapshot at ${percentage}%`, { timestamp });
+        
+        await execAsync(
+          `ffmpeg -ss ${timestamp} -i "${tempVideoPath}" -vframes 1 -vf "scale='min(400,iw)':'min(400,ih)':force_original_aspect_ratio=decrease" -f image2 "${snapshotPath}" -y`
+        );
+
+        const snapshotBuffer = await sharp(snapshotPath).png().toBuffer();
+        const snapshotUrl = `${serverUrl}/media/${resourceId}/video.snapshot_${percentage}`;
+        
+        snapshots.push({ percentage, buffer: snapshotBuffer, url: snapshotUrl });
+        
+        // Store snapshot in database
+        await this.db.storeFeatures(resource.url, [{
+          key: `video.snapshot_${percentage}`,
+          value: snapshotBuffer.toString('base64'),
+          type: FeatureType.BINARY,
+          ttl,
+          extractorTool: 'built-in',
+          metadata: { 
+            timestamp, 
+            percentage,
+            format: 'png',
+            resourceId
+          }
+        }]);
+        
+        // Clean up temp snapshot file
+        await unlink(snapshotPath).catch(() => {});
+      }
+
+      // Add snapshot URLs as features
+      for (const snapshot of snapshots) {
+        features.push({
           id: uuidv4(),
           resourceUrl: resource.url,
-          featureKey: 'video.thumbnail',
-          value: thumbnailBuffer.toString('base64'),
-          valueType: FeatureType.BINARY,
+          featureKey: `video.snapshot_${snapshot.percentage}`,
+          value: snapshot.url,
+          valueType: FeatureType.TEXT,
           generatedAt: now,
           ttl,
           expiresAt: now + ttl,
           extractorTool: 'built-in',
-          metadata: { timestamp: middleTimestamp, format: 'png' }
-        },
+          metadata: { 
+            percentage: snapshot.percentage,
+            format: 'png',
+            mediaType: 'url',
+            resourceId
+          }
+        });
+      }
+      
+      // Add main thumbnail (50% mark)
+      features.push(
         {
           id: uuidv4(),
           resourceUrl: resource.url,
@@ -401,10 +511,17 @@ export class DirectFeatureOrchestrator {
         }
       );
 
-      // Clean up temp files
-      await unlink(thumbnailPath).catch(() => {});
+      logger.verbose('Video snapshots extracted', {
+        resourceId,
+        snapshotCount: snapshots.length,
+        percentages: snapshots.map(s => `${s.percentage}%`)
+      });
 
-      logger.info(`Extracted ${features.length} video features from ${resource.url}`);
+      logger.info(`Extracted ${features.length} video features from ${resource.url}`, {
+        resourceId,
+        featureCount: features.length,
+        snapshotCount: snapshots.length
+      });
     } catch (error: any) {
       logger.error('Video extraction failed:', error);
     } finally {

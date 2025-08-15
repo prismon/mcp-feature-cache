@@ -19,7 +19,7 @@ import {
   UpdateTTLSchema
 } from './types/schemas.js';
 import { createLogger, requestLoggingMiddleware, LogContext } from './utils/logger.js';
-import { setupApiEndpoints } from './api-endpoints.js';
+import { FeatureType } from './types/index.js';
 
 const logger = createLogger('express-mcp-server');
 
@@ -43,9 +43,7 @@ function getServer(): Server {
   );
 
   // List available tools
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
-    logger.trace('ListTools request received');
-    const tools = ({
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       {
         name: 'extract',
@@ -84,25 +82,25 @@ function getServer(): Server {
               items: { type: 'string' },
               description: 'Filter by extractor tools'
             },
-            includeExpired: { type: 'boolean', description: 'Include expired features' }
+            includeExpired: { type: 'boolean', description: 'Include expired features (default: false)' }
           }
         }
       },
       {
         name: 'register_extractor',
-        description: 'Register a new feature extractor',
+        description: 'Register a new MCP feature extractor',
         inputSchema: {
           type: 'object',
           properties: {
             toolName: { type: 'string', description: 'MCP tool name' },
             serverUrl: { type: 'string', description: 'MCP server URL' },
-            capabilities: {
-              type: 'array',
+            capabilities: { 
+              type: 'array', 
               items: { type: 'string' },
               description: 'Supported MIME types'
             },
-            featureKeys: {
-              type: 'array',
+            featureKeys: { 
+              type: 'array', 
               items: { type: 'string' },
               description: 'Features this tool generates'
             },
@@ -113,7 +111,7 @@ function getServer(): Server {
       },
       {
         name: 'list_extractors',
-        description: 'List registered extractors',
+        description: 'List all registered MCP extractors',
         inputSchema: {
           type: 'object',
           properties: {
@@ -124,7 +122,7 @@ function getServer(): Server {
       },
       {
         name: 'update_ttl',
-        description: 'Update TTL for a feature',
+        description: 'Update TTL for a specific feature',
         inputSchema: {
           type: 'object',
           properties: {
@@ -137,16 +135,14 @@ function getServer(): Server {
       },
       {
         name: 'stats',
-        description: 'Get database statistics',
+        description: 'Get feature store statistics',
         inputSchema: {
           type: 'object',
           properties: {}
         }
       }
     ]
-  });
-    return tools;
-  });
+  }));
 
   // Handle tool calls
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -292,8 +288,121 @@ app.use((req, res, next) => {
   next();
 });
 
-// Setup API endpoints for feature values
-setupApiEndpoints(app, sharedDb);
+// Generic feature value API endpoints
+
+// Get a single feature value
+app.get('/api/features/:resourceUrl/:featureKey', async (req: Request, res: Response) => {
+  const { resourceId, size } = req.params;
+  const timer = logger.startTimer('serve-thumbnail');
+  
+  logger.debug('Thumbnail request', { resourceId, size });
+  
+  try {
+    // Create database instance for this request
+    const db = new FeatureDatabase();
+    
+    // Query the database for the thumbnail
+    const features = await db.queryFeatures({
+      featureKeys: [`image.thumbnail_${size}`]
+    });
+    
+    // Find the matching feature by resource ID
+    const feature = features.find(f => {
+      // Extract resource ID from URL or use checksum
+      const urlParts = f.resourceUrl.split('/');
+      const id = urlParts[urlParts.length - 1].replace(/\.[^/.]+$/, '');
+      return id === resourceId || f.resourceUrl.includes(resourceId);
+    });
+    
+    if (!feature) {
+      logger.warn('Thumbnail not found', { resourceId, size });
+      res.status(404).json({ error: 'Thumbnail not found' });
+      return;
+    }
+    
+    // Convert base64 to buffer
+    const imageBuffer = Buffer.from(feature.value, 'base64');
+    
+    // Set appropriate headers
+    res.set({
+      'Content-Type': 'image/png',
+      'Content-Length': imageBuffer.length.toString(),
+      'Cache-Control': 'public, max-age=86400' // Cache for 24 hours
+    });
+    
+    timer();
+    logger.verbose('Serving thumbnail', { 
+      resourceId, 
+      size, 
+      bytes: imageBuffer.length 
+    });
+    
+    res.send(imageBuffer);
+  } catch (error: any) {
+    timer();
+    logger.error('Error serving thumbnail', error, { resourceId, size });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Feature media endpoint (for any binary feature)
+app.get('/media/:resourceId/:featureKey', async (req: Request, res: Response) => {
+  const { resourceId, featureKey } = req.params;
+  const timer = logger.startTimer('serve-media');
+  
+  logger.debug('Media request', { resourceId, featureKey });
+  
+  try {
+    // Create database instance for this request
+    const db = new FeatureDatabase();
+    
+    // Query the database for the feature
+    const features = await db.queryFeatures({
+      featureKeys: [featureKey]
+    });
+    
+    // Find the matching feature
+    const feature = features.find(f => 
+      f.resourceUrl.includes(resourceId) && f.featureKey === featureKey
+    );
+    
+    if (!feature) {
+      logger.warn('Media not found', { resourceId, featureKey });
+      res.status(404).json({ error: 'Media not found' });
+      return;
+    }
+    
+    // Determine content type based on feature key
+    let contentType = 'application/octet-stream';
+    if (featureKey.includes('thumbnail') || featureKey.includes('snapshot')) {
+      contentType = 'image/png';
+    } else if (featureKey.includes('video')) {
+      contentType = 'video/mp4';
+    }
+    
+    // Convert base64 to buffer
+    const mediaBuffer = Buffer.from(feature.value, 'base64');
+    
+    res.set({
+      'Content-Type': contentType,
+      'Content-Length': mediaBuffer.length.toString(),
+      'Cache-Control': 'public, max-age=86400'
+    });
+    
+    timer();
+    logger.verbose('Serving media', { 
+      resourceId, 
+      featureKey, 
+      bytes: mediaBuffer.length 
+    });
+    
+    res.send(mediaBuffer);
+  } catch (error: any) {
+    timer();
+    logger.error('Error serving media', error, { resourceId, featureKey });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // Main MCP endpoint
 app.post('/mcp', async (req: Request, res: Response) => {
@@ -375,53 +484,135 @@ app.get('/mcp', async (req: Request, res: Response) => {
   });
 });
 
+// Session termination not needed in stateless mode
+app.delete('/mcp', async (req: Request, res: Response) => {
+  logger.debug('Received DELETE MCP request');
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: {
+      code: -32000,
+      message: "Method not allowed."
+    },
+    id: null
+  });
+});
+
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'ok', service: 'mcp-feature-store' });
 });
 
-// Welcome/documentation endpoint
+// Root endpoint for documentation
 app.get('/', (req: Request, res: Response) => {
   res.json({
-    service: 'MCP Feature Store',
+    name: 'MCP Feature Store - Express Server',
     version: '1.0.0',
-    endpoints: {
-      mcp: '/mcp',
-      health: '/health',
-      features: {
-        single: '/api/features/:resourceUrl/:featureKey',
-        batch: '/api/features/batch',
-        list: '/api/features/:resourceUrl'
-      },
-      thumbnails: '/thumbnails/:resourceId/:size'
+    transport: 'Streamable HTTP (stateless)',
+    endpoint: '/mcp',
+    method: 'POST',
+    contentType: 'application/json',
+    example: {
+      jsonrpc: '2.0',
+      method: 'tools/list',
+      params: {},
+      id: 1
     },
-    documentation: 'https://github.com/your-org/mcp-feature-store'
+    tools: [
+      'extract - Extract features from resources',
+      'query - Query stored features',
+      'stats - Get database statistics',
+      'list_extractors - List registered extractors',
+      'register_extractor - Register new extractor',
+      'update_ttl - Update feature TTL'
+    ]
   });
 });
 
-// Get resource/feature count on startup
-const getDbStats = async () => {
-  try {
-    const stats = await sharedDb.getStats();
-    return `${stats.totalResources} resources and ${stats.totalFeatures} features`;
-  } catch (error) {
-    logger.warn('Could not get database stats', error);
-    return 'database';
-  }
-};
+// Setup function for any initialization
+async function setupServer() {
+  // Initialize database if needed
+  const db = new FeatureDatabase();
+  const stats = await db.getStats();
+  logger.info(`Database initialized with ${stats.totalResources} resources and ${stats.totalFeatures} features`);
+  db.close();
+  
+  // Setup cleanup task
+  setInterval(async () => {
+    try {
+      const cleanupDb = new FeatureDatabase();
+      const deleted = await cleanupDb.cleanExpiredFeatures();
+      if (deleted > 0) {
+        logger.info(`Cleaned up ${deleted} expired features`);
+      }
+      cleanupDb.close();
+    } catch (error) {
+      logger.error('Cleanup task failed:', error);
+    }
+  }, 60 * 60 * 1000); // Every hour
+}
 
-// Start server
-const PORT = process.env.PORT || process.argv[2] || 3000;
-app.listen(PORT, async () => {
-  const stats = await getDbStats();
-  logger.info(`Database initialized with ${stats}`);
-  logger.info(`🚀 MCP Express Server (Stateless) listening on port ${PORT}`);
-  logger.info(`📡 MCP endpoint: http://localhost:${PORT}/mcp`);
-  logger.info(`📚 API docs: http://localhost:${PORT}/`);
-  logger.info(`🏥 Health check: http://localhost:${PORT}/health`);
-  logger.info(`
-Test with:
+// Parse command line arguments
+const PORT = parseInt(process.argv[2]) || parseInt(process.env.PORT || '3000');
+
+if (process.argv.includes('--help')) {
+  console.log(`
+MCP Feature Store - Express Server with Streamable HTTP
+
+This server implements the MCP protocol using Express and StreamableHTTPServerTransport.
+Each request creates a new server instance for complete isolation (stateless mode).
+
+Usage:
+  npm run express-mcp [port]        Start server on specified port (default: 3000)
+  npm run express-mcp:dev [port]    Start in development mode with auto-reload
+  
+Examples:
+  npm run express-mcp               Start on default port 3000
+  npm run express-mcp 8080          Start on port 8080
+  PORT=4000 npm run express-mcp     Start on port 4000 via env variable
+
+Endpoints:
+  POST /mcp      - MCP protocol endpoint
+  GET /health    - Health check
+  GET /          - API documentation
+
+Testing with curl:
+  # List tools
   curl -X POST http://localhost:${PORT}/mcp \\
     -H "Content-Type: application/json" \\
-    -d '{"jsonrpc":"2.0","method":"tools/list","params":{},"id":1}'`);
+    -d '{"jsonrpc":"2.0","method":"tools/list","params":{},"id":1}'
+
+  # Get stats
+  curl -X POST http://localhost:${PORT}/mcp \\
+    -H "Content-Type: application/json" \\
+    -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"stats","arguments":{}},"id":2}'
+
+Testing with MCP Inspector:
+  1. Start the server: npm run express-mcp ${PORT}
+  2. Open MCP Inspector
+  3. Connect to: http://localhost:${PORT}
+  4. Select "Streamable HTTP" as transport type
+
+Environment Variables:
+  PORT           Server port (default: 3000)
+  DATABASE_PATH  Path to SQLite database
+  LOG_LEVEL      Logging level (info, debug, error)
+`);
+  process.exit(0);
+}
+
+// Start the server
+setupServer().then(() => {
+  app.listen(PORT, () => {
+    logger.info(`🚀 MCP Express Server (Stateless) listening on port ${PORT}`);
+    logger.info(`📡 MCP endpoint: http://localhost:${PORT}/mcp`);
+    logger.info(`📚 API docs: http://localhost:${PORT}/`);
+    logger.info(`🏥 Health check: http://localhost:${PORT}/health`);
+    logger.info('\nTest with:');
+    logger.info(`  curl -X POST http://localhost:${PORT}/mcp \\`);
+    logger.info(`    -H "Content-Type: application/json" \\`);
+    logger.info(`    -d '{"jsonrpc":"2.0","method":"tools/list","params":{},"id":1}'`);
+  });
+}).catch(error => {
+  logger.error('Failed to set up the server:', error);
+  process.exit(1);
 });
