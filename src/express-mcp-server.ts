@@ -240,8 +240,57 @@ function getServer(): Server {
 
         case 'list_extractors': {
           const params = ListExtractorsSchema.parse(args);
-          const extractors = await sharedDb.getExtractors(params);
-          return { content: [{ type: 'text', text: JSON.stringify(extractors, null, 2) }] };
+          // Return built-in extractors since we're using DirectFeatureOrchestrator
+          const builtInExtractors = [
+            {
+              toolName: 'text-extractor',
+              description: 'Extracts text content, word count, line count, and character count',
+              capabilities: ['text/plain', 'text/typescript', 'text/javascript', 'text/python', 'text/markdown'],
+              enabled: true,
+              priority: 1
+            },
+            {
+              toolName: 'image-extractor',
+              description: 'Extracts image metadata and generates thumbnails (150x150, 400x400, 1920x1080)',
+              capabilities: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'],
+              enabled: true,
+              priority: 2
+            },
+            {
+              toolName: 'video-extractor',
+              description: 'Extracts video snapshots at 10% intervals',
+              capabilities: ['video/mp4', 'video/quicktime', 'video/x-msvideo'],
+              enabled: true,
+              priority: 3
+            },
+            {
+              toolName: 'directory-extractor',
+              description: 'Extracts directory metadata including file count, total size, and file listing',
+              capabilities: ['inode/directory'],
+              enabled: true,
+              priority: 4
+            },
+            {
+              toolName: 'embedding-extractor',
+              description: 'Generates text embeddings for RAG (requires OPENAI_API_KEY)',
+              capabilities: ['text/plain', 'text/markdown'],
+              enabled: !!process.env.OPENAI_API_KEY,
+              priority: 5
+            }
+          ];
+          
+          // Filter by params if provided
+          let filteredExtractors = builtInExtractors;
+          if (params.enabled !== undefined) {
+            filteredExtractors = filteredExtractors.filter(e => e.enabled === params.enabled);
+          }
+          if (params.capability) {
+            filteredExtractors = filteredExtractors.filter(e => 
+              e.capabilities.includes(params.capability)
+            );
+          }
+          
+          return { content: [{ type: 'text', text: JSON.stringify(filteredExtractors, null, 2) }] };
         }
 
         case 'update_ttl': {

@@ -11,7 +11,9 @@ import { FeatureStoreError, ErrorCode } from '../types/errors.js';
 import { createLogger } from '../utils/logger.js';
 import { ResourceLoader } from './resource-loader.js';
 import { EmbeddingExtractor } from '../extractors/embedding-extractor.js';
+import { DirectoryIndexer } from './directory-indexer.js';
 import { v4 as uuidv4 } from 'uuid';
+import { dirname, isAbsolute } from 'path';
 import sharp from 'sharp';
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -27,12 +29,14 @@ interface ExtractOptions {
   ttl?: number;
   force?: boolean;
   includeEmbeddings?: boolean;
+  skipDirectoryIndexing?: boolean; // Flag to prevent recursive directory indexing
 }
 
 export class DirectFeatureOrchestrator {
   private db: FeatureDatabase;
   private resourceLoader: ResourceLoader;
   private embeddingExtractor: EmbeddingExtractor;
+  private directoryIndexer: DirectoryIndexer;
   private concurrencyLimit = pLimit(5);
   private tempDir: string;
 
@@ -40,6 +44,7 @@ export class DirectFeatureOrchestrator {
     this.db = db;
     this.resourceLoader = new ResourceLoader();
     this.embeddingExtractor = new EmbeddingExtractor();
+    this.directoryIndexer = new DirectoryIndexer(db, this); // Pass this orchestrator
     this.tempDir = join(tmpdir(), 'mcp-feature-store');
     this.initTempDir();
   }
@@ -66,6 +71,33 @@ export class DirectFeatureOrchestrator {
     });
     
     try {
+      // Check if this is a file and if we should index its directory
+      // Skip directory indexing if the flag is set (to prevent recursion)
+      if (!options.skipDirectoryIndexing && (resourceUrl.startsWith('/') || resourceUrl.startsWith('file://'))) {
+        const filePath = resourceUrl.replace('file://', '');
+        const shouldIndex = await this.directoryIndexer.shouldIndexDirectory(filePath);
+        
+        if (shouldIndex) {
+          logger.info('Indexing directory for file', { 
+            file: filePath,
+            directory: dirname(filePath)
+          });
+          
+          // Index the directory in the background
+          this.directoryIndexer.indexDirectory(dirname(filePath), {
+            includeSubdirectories: false,
+            ttl: options.ttl || 86400,
+            includeEmbeddings: options.includeEmbeddings,
+            concurrency: 3,
+            maxFiles: 50 // Limit to prevent overwhelming the system
+          }).catch(error => {
+            logger.error('Background directory indexing failed', error, {
+              directory: dirname(filePath)
+            });
+          });
+        }
+      }
+      
       // Load resource
       logger.debug('Loading resource', { url: resourceUrl });
       const loadTimer = logger.startTimer('resource-load');
@@ -138,7 +170,12 @@ export class DirectFeatureOrchestrator {
         url: resourceUrl 
       });
       
-      if (resource.mimeType?.startsWith('image/')) {
+      if (resource.mimeType === 'inode/directory' || resource.type === 'directory') {
+        logger.trace('Using directory extractor', { mimeType });
+        const dirTimer = logger.startTimer('extract-directory-features');
+        features = await this.extractDirectoryFeatures(resource, options.ttl || 86400);
+        dirTimer();
+      } else if (resource.mimeType?.startsWith('image/')) {
         logger.trace('Using image extractor', { mimeType });
         const imageTimer = logger.startTimer('extract-image-features');
         features = await this.extractImageFeatures(resource, options.ttl || 86400);
@@ -242,24 +279,25 @@ export class DirectFeatureOrchestrator {
       const now = Math.floor(Date.now() / 1000);
 
       // Store thumbnails in database but return URLs
+      const encodedResourceUrl = encodeURIComponent(resource.url);
       const thumbnailFeatures = [
         {
           key: 'image.thumbnail_small',
           buffer: thumbnailSmall,
           dimensions: '150x150',
-          url: `${serverUrl}/thumbnails/${resourceId}/small`
+          url: `${serverUrl}/api/features/${encodedResourceUrl}/image.thumbnail_small?format=raw`
         },
         {
           key: 'image.thumbnail_medium',
           buffer: thumbnailMedium,
           dimensions: '400x400',
-          url: `${serverUrl}/thumbnails/${resourceId}/medium`
+          url: `${serverUrl}/api/features/${encodedResourceUrl}/image.thumbnail_medium?format=raw`
         },
         {
           key: 'image.thumbnail_large',
           buffer: thumbnailLarge,
           dimensions: '1920x1080',
-          url: `${serverUrl}/thumbnails/${resourceId}/large`
+          url: `${serverUrl}/api/features/${encodedResourceUrl}/image.thumbnail_large?format=raw`
         }
       ];
       
@@ -285,7 +323,7 @@ export class DirectFeatureOrchestrator {
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'image.thumbnail.small',
-          value: `${serverUrl}/thumbnails/${resourceId}/small`,
+          value: thumbnailFeatures[0].url,
           valueType: FeatureType.TEXT,
           generatedAt: now,
           ttl,
@@ -302,7 +340,7 @@ export class DirectFeatureOrchestrator {
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'image.thumbnail.medium',
-          value: `${serverUrl}/thumbnails/${resourceId}/medium`,
+          value: thumbnailFeatures[1].url,
           valueType: FeatureType.TEXT,
           generatedAt: now,
           ttl,
@@ -319,7 +357,7 @@ export class DirectFeatureOrchestrator {
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'image.thumbnail.large',
-          value: `${serverUrl}/thumbnails/${resourceId}/large`,
+          value: thumbnailFeatures[2].url,
           valueType: FeatureType.TEXT,
           generatedAt: now,
           ttl,
@@ -593,6 +631,157 @@ export class DirectFeatureOrchestrator {
 
     logger.info(`Extracted ${features.length} text features from ${resource.url}`);
     return features;
+  }
+
+  private async extractDirectoryFeatures(resource: Resource, ttl: number): Promise<Feature[]> {
+    const features: Feature[] = [];
+    const now = Math.floor(Date.now() / 1000);
+    
+    try {
+      // Extract directory path from URL
+      const dirPath = resource.url.replace('file://', '');
+      
+      // Import fs modules
+      const { readdir, stat } = await import('fs/promises');
+      const { join, basename } = await import('path');
+      
+      // Get directory contents
+      const entries = await readdir(dirPath, { withFileTypes: true });
+      
+      // Separate files and subdirectories
+      const files = entries.filter(e => e.isFile());
+      const subdirs = entries.filter(e => e.isDirectory());
+      
+      // Calculate total size
+      let totalSize = 0;
+      const fileSizes: { name: string; size: number }[] = [];
+      
+      for (const file of files) {
+        try {
+          const filePath = join(dirPath, file.name);
+          const stats = await stat(filePath);
+          totalSize += stats.size;
+          fileSizes.push({ name: file.name, size: stats.size });
+        } catch (error) {
+          logger.warn(`Failed to stat file: ${file.name}`, error);
+        }
+      }
+      
+      // Sort files by size (largest first)
+      fileSizes.sort((a, b) => b.size - a.size);
+      
+      // Create directory metadata
+      const dirMetadata = {
+        name: basename(dirPath),
+        path: dirPath,
+        fileCount: files.length,
+        subdirectoryCount: subdirs.length,
+        totalSize,
+        averageFileSize: files.length > 0 ? Math.round(totalSize / files.length) : 0,
+        largestFiles: fileSizes.slice(0, 10).map(f => ({
+          name: f.name,
+          size: f.size,
+          sizeFormatted: this.formatFileSize(f.size)
+        })),
+        fileExtensions: this.getFileExtensions(files.map(f => f.name)),
+        files: files.map(f => f.name),
+        subdirectories: subdirs.map(d => d.name)
+      };
+      
+      // Add features
+      features.push(
+        {
+          id: uuidv4(),
+          resourceUrl: resource.url,
+          featureKey: 'directory.metadata',
+          value: JSON.stringify(dirMetadata),
+          valueType: FeatureType.JSON,
+          generatedAt: now,
+          ttl,
+          expiresAt: now + ttl,
+          extractorTool: 'directory-extractor',
+          metadata: { 
+            fileCount: files.length,
+            subdirectoryCount: subdirs.length
+          }
+        },
+        {
+          id: uuidv4(),
+          resourceUrl: resource.url,
+          featureKey: 'directory.file_count',
+          value: String(files.length),
+          valueType: FeatureType.NUMBER,
+          generatedAt: now,
+          ttl,
+          expiresAt: now + ttl,
+          extractorTool: 'directory-extractor',
+          metadata: {}
+        },
+        {
+          id: uuidv4(),
+          resourceUrl: resource.url,
+          featureKey: 'directory.total_size',
+          value: String(totalSize),
+          valueType: FeatureType.NUMBER,
+          generatedAt: now,
+          ttl,
+          expiresAt: now + ttl,
+          extractorTool: 'directory-extractor',
+          metadata: { formatted: this.formatFileSize(totalSize) }
+        },
+        {
+          id: uuidv4(),
+          resourceUrl: resource.url,
+          featureKey: 'directory.subdirectory_count',
+          value: String(subdirs.length),
+          valueType: FeatureType.NUMBER,
+          generatedAt: now,
+          ttl,
+          expiresAt: now + ttl,
+          extractorTool: 'directory-extractor',
+          metadata: {}
+        }
+      );
+      
+      logger.info('Extracted directory features', {
+        directory: dirPath,
+        featureCount: features.length,
+        fileCount: files.length,
+        totalSize
+      });
+      
+    } catch (error) {
+      logger.error('Failed to extract directory features', error, {
+        url: resource.url
+      });
+    }
+    
+    return features;
+  }
+  
+  private formatFileSize(bytes: number): string {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = bytes;
+    let unitIndex = 0;
+    
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex++;
+    }
+    
+    return `${size.toFixed(2)} ${units[unitIndex]}`;
+  }
+  
+  private getFileExtensions(fileNames: string[]): Record<string, number> {
+    const extensions: Record<string, number> = {};
+    
+    for (const fileName of fileNames) {
+      const dotIndex = fileName.lastIndexOf('.');
+      const ext = dotIndex > 0 ? fileName.slice(dotIndex).toLowerCase() : 'no-extension';
+      extensions[ext] = (extensions[ext] || 0) + 1;
+    }
+    
+    return extensions;
   }
 
   async *extractFeaturesStream(

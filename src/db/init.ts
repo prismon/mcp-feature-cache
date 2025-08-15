@@ -24,7 +24,7 @@ const schema = `
 -- Resources table
 CREATE TABLE IF NOT EXISTS resources (
   url TEXT PRIMARY KEY,
-  type TEXT NOT NULL CHECK(type IN ('file', 'url')),
+  type TEXT NOT NULL CHECK(type IN ('file', 'url', 'directory')),
   last_processed INTEGER NOT NULL,
   checksum TEXT,
   size INTEGER,

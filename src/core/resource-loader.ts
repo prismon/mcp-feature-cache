@@ -21,7 +21,11 @@ export class ResourceLoader {
   }
 
   async load(resourceUrl: string): Promise<LoadedResource> {
-    if (this.isUrl(resourceUrl)) {
+    // Handle file:// URLs
+    if (resourceUrl.startsWith('file://')) {
+      const filePath = resourceUrl.replace('file://', '');
+      return this.loadFile(filePath);
+    } else if (this.isUrl(resourceUrl)) {
       return this.loadUrl(resourceUrl);
     } else {
       return this.loadFile(resourceUrl);
@@ -45,10 +49,24 @@ export class ResourceLoader {
       // Check file stats
       const stats = await stat(absolutePath);
       
+      // Handle directories separately
+      if (stats.isDirectory()) {
+        logger.info(`Loading directory: ${absolutePath}`);
+        return {
+          url: `file://${absolutePath}`,
+          type: 'directory' as ResourceType,
+          content: Buffer.from(''), // Directories don't have content
+          size: 0,
+          mimeType: 'inode/directory',
+          checksum: '',
+          lastModified: stats.mtime
+        };
+      }
+      
       if (!stats.isFile()) {
         throw new FeatureStoreError(
           ErrorCode.INVALID_URL,
-          `Path is not a file: ${filePath}`
+          `Path is neither a file nor directory: ${filePath}`
         );
       }
 

@@ -208,30 +208,5 @@ export function setupApiEndpoints(app: any, sharedDb: FeatureDatabase) {
     }
   });
 
-  // Convenience endpoint for thumbnails (backward compatibility)
-  app.get('/thumbnails/:resourceId/:size', async (req: Request, res: Response) => {
-    const { resourceId, size } = req.params;
-    
-    // Map size to feature key
-    const featureKey = `image.thumbnail_${size}`;
-    
-    // Find the resource that matches this ID
-    // This is a simplified version - in production you'd want a better mapping
-    const allFeatures = await sharedDb.queryFeatures({ featureKeys: [featureKey] });
-    const feature = allFeatures.find(f => {
-      const metadata = f.metadata as any;
-      return metadata?.resourceId === resourceId;
-    });
-    
-    if (!feature) {
-      res.status(404).json({ error: 'Thumbnail not found' });
-      return;
-    }
-    
-    // Redirect to the generic API
-    const encodedUrl = encodeURIComponent(feature.resourceUrl);
-    res.redirect(`/api/features/${encodedUrl}/${featureKey}?format=raw`);
-  });
-
   logger.info('API endpoints configured');
 }
