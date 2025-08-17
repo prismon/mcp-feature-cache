@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "dev": "tsx watch src/express-mcp-server.ts",
+    "dev": "tsx watch --no-stdin src/express-mcp-server.ts",
+    "dev:background": "tsx src/express-mcp-server.ts",
     "start": "tsx src/express-mcp-server.ts",
     "test": "vitest",
     "test:smoke": "tsx test/smoke-test.ts",

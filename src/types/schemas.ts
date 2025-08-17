@@ -6,8 +6,10 @@ export const ExtractToolSchema = z.object({
   extractors: z.array(z.string()).optional().describe('Specific extractors to use (optional)'),
   ttl: z.number().optional().default(3600).describe('TTL in seconds'),
   stream: z.boolean().optional().default(false).describe('Enable streaming mode'),
-  force: z.boolean().optional().default(false).describe('Force re-extraction'),
-  includeEmbeddings: z.boolean().optional().default(false).describe('Generate embeddings for text content')
+  force: z.boolean().optional().default(false).describe('Force re-extraction of all features'),
+  includeEmbeddings: z.boolean().optional().default(false).describe('Generate embeddings for text content'),
+  mode: z.enum(['minimal', 'standard', 'maximal']).optional().default('standard').describe('Extraction mode: minimal (basic text only), standard (text + metadata), maximal (all features including embeddings)'),
+  updateMissing: z.boolean().optional().default(true).describe('Update only missing features when re-running on existing resources')
 });
 
 export const QueryToolSchema = z.object({

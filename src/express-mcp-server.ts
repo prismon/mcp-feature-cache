@@ -222,6 +222,21 @@ function getServer(): Server {
         case 'query': {
           const params = QueryToolSchema.parse(args);
           const features = await sharedDb.queryFeatures(params);
+          
+          // Check if we have any features for this URL
+          if (features.length === 0 && params.url) {
+            // Check if the resource exists at all
+            const resources = await sharedDb.getResources({ url: params.url });
+            if (resources.length === 0) {
+              return { 
+                content: [{ 
+                  type: 'text', 
+                  text: `No features found for ${params.url}.\n\nThis path has not been extracted yet. Please run 'extract' on this path first to generate features.\n\nExample:\n  extract url="${params.url}"` 
+                }] 
+              };
+            }
+          }
+          
           return { content: [{ type: 'text', text: JSON.stringify(features, null, 2) }] };
         }
 
@@ -460,17 +475,39 @@ const getDbStats = async () => {
 };
 
 // Start server
-const PORT = process.env.PORT || process.argv[2] || 3000;
-app.listen(PORT, async () => {
+const PORT = Number(process.env.PORT || process.argv[2] || 3033);
+const HOST = process.env.HOST || '0.0.0.0'; // Listen on all interfaces by default
+
+const server = app.listen(PORT, HOST, async () => {
   const stats = await getDbStats();
   logger.info(`Database initialized with ${stats}`);
-  logger.info(`🚀 MCP Express Server (Stateless) listening on port ${PORT}`);
-  logger.info(`📡 MCP endpoint: http://localhost:${PORT}/mcp`);
-  logger.info(`📚 API docs: http://localhost:${PORT}/`);
-  logger.info(`🏥 Health check: http://localhost:${PORT}/health`);
+  logger.info(`🚀 MCP Express Server (Stateless) listening on ${HOST}:${PORT}`);
+  logger.info(`📡 MCP endpoint: http://${HOST}:${PORT}/mcp`);
+  logger.info(`📚 API docs: http://${HOST}:${PORT}/`);
+  logger.info(`🏥 Health check: http://${HOST}:${PORT}/health`);
   logger.info(`
 Test with:
-  curl -X POST http://localhost:${PORT}/mcp \\
+  curl -X POST http://${HOST}:${PORT}/mcp \\
     -H "Content-Type: application/json" \\
     -d '{"jsonrpc":"2.0","method":"tools/list","params":{},"id":1}'`);
+});
+
+// Verify server is actually listening
+server.on('listening', () => {
+  const addr = server.address();
+  if (addr && typeof addr === 'object') {
+    logger.info(`✅ Server confirmed listening on ${addr.address}:${addr.port}`);
+  }
+});
+
+// Handle server errors
+server.on('error', (error: any) => {
+  if (error.code === 'EADDRINUSE') {
+    logger.error(`Port ${PORT} is already in use`);
+  } else if (error.code === 'EACCES') {
+    logger.error(`Permission denied to bind to ${HOST}:${PORT}`);
+  } else {
+    logger.error('Server error:', error);
+  }
+  process.exit(1);
 });

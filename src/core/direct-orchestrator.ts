@@ -30,6 +30,8 @@ interface ExtractOptions {
   force?: boolean;
   includeEmbeddings?: boolean;
   skipDirectoryIndexing?: boolean; // Flag to prevent recursive directory indexing
+  mode?: 'minimal' | 'standard' | 'maximal';
+  updateMissing?: boolean;
 }
 
 export class DirectFeatureOrchestrator {
@@ -112,27 +114,37 @@ export class DirectFeatureOrchestrator {
         checksum: resource.checksum
       });
       
-      // Check if we should skip extraction
+      // Check if we should skip extraction or update missing features
+      let existingFeatures: Feature[] = [];
       if (!options.force) {
-        logger.trace('Checking for cached features', { url: resourceUrl });
-        const existingResource = await this.db.getResource(resourceUrl);
+        logger.trace('Checking for cached features', { url: resource.url });
+        const existingResource = await this.db.getResource(resource.url);
         
         if (existingResource) {
           logger.verbose('Found existing resource', {
-            url: resourceUrl,
+            url: resource.url,
             checksum: existingResource.checksum,
             lastProcessed: existingResource.lastProcessed
           });
           
           if (existingResource.checksum === resource.checksum) {
-            const existingFeatures = await this.db.queryFeatures({ url: resourceUrl });
-            if (existingFeatures.length > 0) {
+            existingFeatures = await this.db.queryFeatures({ url: resource.url });
+            
+            // If updateMissing is false and we have features, return cached
+            if (!options.updateMissing && existingFeatures.length > 0) {
               timer();
-              logger.info(`Using cached features for ${resourceUrl}`, {
+              logger.info(`Using cached features for ${resource.url}`, {
                 featureCount: existingFeatures.length,
                 cached: true
               });
               return existingFeatures;
+            }
+            
+            // If updateMissing is true, we'll continue to extract missing features
+            if (options.updateMissing && existingFeatures.length > 0) {
+              logger.info('Will update missing features only', {
+                existingCount: existingFeatures.length
+              });
             }
           } else {
             logger.debug('Resource checksum changed, re-extracting', {
@@ -147,11 +159,11 @@ export class DirectFeatureOrchestrator {
         logger.debug('Force extraction enabled, skipping cache check');
       }
 
-      // Save/update resource
-      logger.trace('Upserting resource in database', { url: resourceUrl });
+      // Save/update resource - use normalized URL from resource loader
+      logger.trace('Upserting resource in database', { url: resource.url });
       const dbTimer = logger.startTimer('db-upsert-resource');
       await this.db.upsertResource({
-        url: resourceUrl,
+        url: resource.url,  // Use normalized URL
         type: resource.type,
         lastProcessed: Math.floor(Date.now() / 1000),
         checksum: resource.checksum,
@@ -159,31 +171,94 @@ export class DirectFeatureOrchestrator {
         mimeType: resource.mimeType
       });
       dbTimer();
-      logger.verbose('Resource saved to database', { url: resourceUrl });
+      logger.verbose('Resource saved to database', { url: resource.url });
 
       // Extract features based on MIME type
       let features: Feature[] = [];
       const mimeType = resource.mimeType || 'unknown';
       
+      // Build set of existing feature keys for checking
+      const existingFeatureKeys = new Set(existingFeatures.map(f => f.featureKey));
+      
       logger.debug('Selecting extractor based on MIME type', { 
         mimeType,
-        url: resourceUrl 
+        url: resourceUrl,
+        mode: options.mode || 'standard',
+        updateMissing: options.updateMissing !== false,
+        existingFeatures: existingFeatureKeys.size
       });
       
-      if (resource.mimeType === 'inode/directory' || resource.type === 'directory') {
-        logger.trace('Using directory extractor', { mimeType });
+      if (resource.mimeType === 'inode/directory' || resource.type === ResourceType.DIRECTORY) {
+        logger.info('Processing directory - will recursively extract features from all files', { 
+          directory: resource.url 
+        });
+        
+        // First extract directory metadata
         const dirTimer = logger.startTimer('extract-directory-features');
-        features = await this.extractDirectoryFeatures(resource, options.ttl || 86400);
+        features = await this.extractDirectoryFeatures(
+          resource, 
+          options.ttl || 86400,
+          options.mode || 'standard',
+          existingFeatureKeys,
+          options.updateMissing !== false
+        );
         dirTimer();
+        
+        // Then recursively process all files in the directory
+        const dirPath = resource.url.replace('file://', '');
+        const processedFiles = await this.recursivelyExtractFromDirectory(dirPath, {
+          ...options,
+          skipDirectoryIndexing: true // Prevent infinite recursion
+        });
+        
+        logger.info('Directory extraction completed', {
+          directory: dirPath,
+          filesProcessed: processedFiles.length,
+          totalFeatures: features.length
+        });
+        
+        // Add the summary feature to the directory features
+        features.push({
+          id: uuidv4(),
+          resourceUrl: resource.url,
+          featureKey: 'extraction.summary',
+          value: JSON.stringify({
+            type: 'directory',
+            path: dirPath,
+            filesProcessed: processedFiles.length,
+            directoryFeatures: features.length,
+            message: `Successfully extracted features from ${processedFiles.length} files in directory`
+          }),
+          valueType: FeatureType.JSON,
+          generatedAt: Math.floor(Date.now() / 1000),
+          ttl: options.ttl || 86400,
+          expiresAt: Math.floor(Date.now() / 1000) + (options.ttl || 86400),
+          extractorTool: 'directory-extractor',
+          metadata: { filesProcessed: processedFiles }
+        });
+        
+        // Don't return early - let the features be stored below
       } else if (resource.mimeType?.startsWith('image/')) {
         logger.trace('Using image extractor', { mimeType });
         const imageTimer = logger.startTimer('extract-image-features');
-        features = await this.extractImageFeatures(resource, options.ttl || 86400);
+        features = await this.extractImageFeatures(
+          resource, 
+          options.ttl || 86400,
+          options.mode || 'standard',
+          existingFeatureKeys,
+          options.updateMissing !== false
+        );
         imageTimer();
       } else if (resource.mimeType?.startsWith('video/')) {
         logger.trace('Using video extractor', { mimeType });
         const videoTimer = logger.startTimer('extract-video-features');
-        features = await this.extractVideoFeatures(resource, options.ttl || 86400);
+        features = await this.extractVideoFeatures(
+          resource, 
+          options.ttl || 86400,
+          options.mode || 'standard',
+          existingFeatureKeys,
+          options.updateMissing !== false
+        );
         videoTimer();
       } else if (resource.mimeType?.startsWith('text/') || 
                  resource.mimeType === 'application/json' ||
@@ -191,7 +266,13 @@ export class DirectFeatureOrchestrator {
                  resource.mimeType === 'text/typescript') {
         logger.trace('Using text extractor', { mimeType });
         const textTimer = logger.startTimer('extract-text-features');
-        features = await this.extractTextFeatures(resource, options.ttl || 86400);
+        features = await this.extractTextFeatures(
+          resource, 
+          options.ttl || 86400,
+          options.mode || 'standard',
+          existingFeatureKeys,
+          options.updateMissing !== false
+        );
         textTimer();
         
         // Optionally add embeddings for text content
@@ -210,16 +291,25 @@ export class DirectFeatureOrchestrator {
 
       // Store features in database
       if (features.length > 0) {
+        logger.debug('Storing features', {
+          url: resource.url,
+          featureCount: features.length,
+          featureKeys: features.map(f => f.featureKey)
+        });
+        
         const featuresToStore = features.map(f => ({
           key: f.featureKey,
           value: f.value,
           type: f.valueType,
           ttl: f.ttl,
-          extractorTool: 'built-in',
+          extractorTool: f.extractorTool || 'built-in',
           metadata: f.metadata
         }));
 
-        await this.db.storeFeatures(resourceUrl, featuresToStore);
+        await this.db.storeFeatures(resource.url, featuresToStore);
+        logger.trace('Features stored successfully');
+      } else {
+        logger.debug('No features to store', { url: resource.url });
       }
 
       return features;
@@ -234,7 +324,13 @@ export class DirectFeatureOrchestrator {
     }
   }
 
-  private async extractImageFeatures(resource: Resource & { content: Buffer }, ttl: number): Promise<Feature[]> {
+  private async extractImageFeatures(
+    resource: Resource & { content: Buffer }, 
+    ttl: number,
+    mode: 'minimal' | 'standard' | 'maximal' = 'standard',
+    existingFeatureKeys: Set<string> = new Set(),
+    updateMissing: boolean = true
+  ): Promise<Feature[]> {
     const features: Feature[] = [];
     const buffer = resource.content;
     
@@ -280,26 +376,35 @@ export class DirectFeatureOrchestrator {
 
       // Store thumbnails in database but return URLs
       const encodedResourceUrl = encodeURIComponent(resource.url);
-      const thumbnailFeatures = [
-        {
+      const thumbnailFeatures = [];
+      
+      // Only generate thumbnails if they should be extracted
+      if (this.shouldExtractFeature('image.thumbnail.small', mode, existingFeatureKeys, updateMissing)) {
+        thumbnailFeatures.push({
           key: 'image.thumbnail_small',
           buffer: thumbnailSmall,
           dimensions: '150x150',
           url: `${serverUrl}/api/features/${encodedResourceUrl}/image.thumbnail_small?format=raw`
-        },
-        {
+        });
+      }
+      
+      if (this.shouldExtractFeature('image.thumbnail.medium', mode, existingFeatureKeys, updateMissing)) {
+        thumbnailFeatures.push({
           key: 'image.thumbnail_medium',
           buffer: thumbnailMedium,
           dimensions: '400x400',
           url: `${serverUrl}/api/features/${encodedResourceUrl}/image.thumbnail_medium?format=raw`
-        },
-        {
+        });
+      }
+      
+      if (this.shouldExtractFeature('image.thumbnail.large', mode, existingFeatureKeys, updateMissing) && mode === 'maximal') {
+        thumbnailFeatures.push({
           key: 'image.thumbnail_large',
           buffer: thumbnailLarge,
           dimensions: '1920x1080',
           url: `${serverUrl}/api/features/${encodedResourceUrl}/image.thumbnail_large?format=raw`
-        }
-      ];
+        });
+      }
       
       // Store actual image data in database
       for (const thumb of thumbnailFeatures) {
@@ -318,71 +423,44 @@ export class DirectFeatureOrchestrator {
       }
       
       // Return features with URLs instead of inline data
-      features.push(
-        {
+      for (const thumb of thumbnailFeatures) {
+        features.push({
           id: uuidv4(),
           resourceUrl: resource.url,
-          featureKey: 'image.thumbnail.small',
-          value: thumbnailFeatures[0].url,
+          featureKey: thumb.key.replace('_', '.'),  // Convert image_thumbnail_small to image.thumbnail.small
+          value: thumb.url,
           valueType: FeatureType.TEXT,
           generatedAt: now,
           ttl,
           expiresAt: now + ttl,
           extractorTool: 'built-in',
           metadata: { 
-            dimensions: '150x150', 
+            dimensions: thumb.dimensions, 
             format: 'png',
             mediaType: 'url',
             resourceId
           }
-        },
-        {
-          id: uuidv4(),
-          resourceUrl: resource.url,
-          featureKey: 'image.thumbnail.medium',
-          value: thumbnailFeatures[1].url,
-          valueType: FeatureType.TEXT,
-          generatedAt: now,
-          ttl,
-          expiresAt: now + ttl,
-          extractorTool: 'built-in',
-          metadata: { 
-            dimensions: '400x400', 
-            format: 'png',
-            mediaType: 'url',
-            resourceId
-          }
-        },
-        {
-          id: uuidv4(),
-          resourceUrl: resource.url,
-          featureKey: 'image.thumbnail.large',
-          value: thumbnailFeatures[2].url,
-          valueType: FeatureType.TEXT,
-          generatedAt: now,
-          ttl,
-          expiresAt: now + ttl,
-          extractorTool: 'built-in',
-          metadata: { 
-            dimensions: '1920x1080', 
-            format: 'png',
-            mediaType: 'url',
-            resourceId
-          }
-        },
-        {
-          id: uuidv4(),
-          resourceUrl: resource.url,
-          featureKey: 'image.dimensions',
-          value: JSON.stringify({ width: metadata.width, height: metadata.height }),
-          valueType: FeatureType.JSON,
-          generatedAt: now,
-          ttl,
-          expiresAt: now + ttl,
-          extractorTool: 'built-in',
-          metadata: {}
-        },
-        {
+        });
+      }
+      
+      if (this.shouldExtractFeature('image.dimensions', mode, existingFeatureKeys, updateMissing)) {
+        features.push(
+          {
+            id: uuidv4(),
+            resourceUrl: resource.url,
+            featureKey: 'image.dimensions',
+            value: JSON.stringify({ width: metadata.width, height: metadata.height }),
+            valueType: FeatureType.JSON,
+            generatedAt: now,
+            ttl,
+            expiresAt: now + ttl,
+            extractorTool: 'built-in',
+            metadata: {}
+          });
+      }
+      
+      if (this.shouldExtractFeature('image.format', mode, existingFeatureKeys, updateMissing)) {
+        features.push({
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'image.format',
@@ -393,8 +471,11 @@ export class DirectFeatureOrchestrator {
           expiresAt: now + ttl,
           extractorTool: 'built-in',
           metadata: {}
-        },
-        {
+        });
+      }
+      
+      if (this.shouldExtractFeature('image.dominant_colors', mode, existingFeatureKeys, updateMissing) && mode === 'maximal') {
+        features.push({
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'image.dominant_colors',
@@ -405,8 +486,8 @@ export class DirectFeatureOrchestrator {
           expiresAt: now + ttl,
           extractorTool: 'built-in',
           metadata: {}
-        }
-      );
+        });
+      }
 
       logger.info(`Extracted ${features.length} image features from ${resource.url}`, {
         resourceId,
@@ -421,7 +502,13 @@ export class DirectFeatureOrchestrator {
     return features;
   }
 
-  private async extractVideoFeatures(resource: Resource & { content: Buffer }, ttl: number): Promise<Feature[]> {
+  private async extractVideoFeatures(
+    resource: Resource & { content: Buffer }, 
+    ttl: number,
+    mode: 'minimal' | 'standard' | 'maximal' = 'standard',
+    existingFeatureKeys: Set<string> = new Set(),
+    updateMissing: boolean = true
+  ): Promise<Feature[]> {
     const features: Feature[] = [];
     
     // Generate resource ID
@@ -465,8 +552,25 @@ export class DirectFeatureOrchestrator {
 
       const now = Math.floor(Date.now() / 1000);
 
-      // Extract snapshots at 10% intervals (0%, 10%, 20%, ..., 90%)
-      for (let percentage = 0; percentage <= 90; percentage += 10) {
+      // Extract snapshots based on mode
+      const percentagesToExtract: number[] = [];
+      if (mode === 'minimal') {
+        // No video snapshots in minimal mode
+      } else if (mode === 'standard') {
+        // Only 50% snapshot in standard mode
+        if (this.shouldExtractFeature('video.snapshot_50', mode, existingFeatureKeys, updateMissing)) {
+          percentagesToExtract.push(50);
+        }
+      } else if (mode === 'maximal') {
+        // All snapshots in maximal mode
+        for (let percentage = 0; percentage <= 90; percentage += 10) {
+          if (this.shouldExtractFeature(`video.snapshot_${percentage}`, mode, existingFeatureKeys, updateMissing)) {
+            percentagesToExtract.push(percentage);
+          }
+        }
+      }
+      
+      for (const percentage of percentagesToExtract) {
         const timestamp = (duration * percentage) / 100;
         const snapshotPath = join(this.tempDir, `${uuidv4()}.png`);
         
@@ -521,9 +625,9 @@ export class DirectFeatureOrchestrator {
         });
       }
       
-      // Add main thumbnail (50% mark)
-      features.push(
-        {
+      // Add video metadata features
+      if (this.shouldExtractFeature('video.dimensions', mode, existingFeatureKeys, updateMissing)) {
+        features.push({
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'video.dimensions',
@@ -534,8 +638,11 @@ export class DirectFeatureOrchestrator {
           expiresAt: now + ttl,
           extractorTool: 'built-in',
           metadata: {}
-        },
-        {
+        });
+      }
+      
+      if (this.shouldExtractFeature('video.duration', mode, existingFeatureKeys, updateMissing)) {
+        features.push({
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'video.duration',
@@ -546,8 +653,8 @@ export class DirectFeatureOrchestrator {
           expiresAt: now + ttl,
           extractorTool: 'built-in',
           metadata: { unit: 'seconds' }
-        }
-      );
+        });
+      }
 
       logger.verbose('Video snapshots extracted', {
         resourceId,
@@ -570,7 +677,13 @@ export class DirectFeatureOrchestrator {
     return features;
   }
 
-  private async extractTextFeatures(resource: Resource & { content: Buffer }, ttl: number): Promise<Feature[]> {
+  private async extractTextFeatures(
+    resource: Resource & { content: Buffer }, 
+    ttl: number,
+    mode: 'minimal' | 'standard' | 'maximal' = 'standard',
+    existingFeatureKeys: Set<string> = new Set(),
+    updateMissing: boolean = true
+  ): Promise<Feature[]> {
     const features: Feature[] = [];
     const text = resource.content.toString('utf-8');
     const lines = text.split('\n');
@@ -578,8 +691,9 @@ export class DirectFeatureOrchestrator {
     
     const now = Math.floor(Date.now() / 1000);
 
-    features.push(
-      {
+    // Only add features that should be extracted based on mode and existing features
+    if (this.shouldExtractFeature('text.content', mode, existingFeatureKeys, updateMissing)) {
+      features.push({
         id: uuidv4(),
         resourceUrl: resource.url,
         featureKey: 'text.content',
@@ -590,8 +704,11 @@ export class DirectFeatureOrchestrator {
         expiresAt: now + ttl,
         extractorTool: 'built-in',
         metadata: {}
-      },
-      {
+      });
+    }
+    
+    if (this.shouldExtractFeature('text.word_count', mode, existingFeatureKeys, updateMissing)) {
+      features.push({
         id: uuidv4(),
         resourceUrl: resource.url,
         featureKey: 'text.word_count',
@@ -602,8 +719,11 @@ export class DirectFeatureOrchestrator {
         expiresAt: now + ttl,
         extractorTool: 'built-in',
         metadata: {}
-      },
-      {
+      });
+    }
+    
+    if (this.shouldExtractFeature('text.line_count', mode, existingFeatureKeys, updateMissing)) {
+      features.push({
         id: uuidv4(),
         resourceUrl: resource.url,
         featureKey: 'text.line_count',
@@ -614,8 +734,11 @@ export class DirectFeatureOrchestrator {
         expiresAt: now + ttl,
         extractorTool: 'built-in',
         metadata: {}
-      },
-      {
+      });
+    }
+    
+    if (this.shouldExtractFeature('text.char_count', mode, existingFeatureKeys, updateMissing)) {
+      features.push({
         id: uuidv4(),
         resourceUrl: resource.url,
         featureKey: 'text.char_count',
@@ -626,14 +749,24 @@ export class DirectFeatureOrchestrator {
         expiresAt: now + ttl,
         extractorTool: 'built-in',
         metadata: {}
-      }
-    );
+      });
+    }
 
-    logger.info(`Extracted ${features.length} text features from ${resource.url}`);
+    logger.info(`Extracted ${features.length} text features from ${resource.url}`, {
+      mode,
+      updateMissing,
+      skipped: 4 - features.length
+    });
     return features;
   }
 
-  private async extractDirectoryFeatures(resource: Resource, ttl: number): Promise<Feature[]> {
+  private async extractDirectoryFeatures(
+    resource: Resource, 
+    ttl: number,
+    mode: 'minimal' | 'standard' | 'maximal' = 'standard',
+    existingFeatureKeys: Set<string> = new Set(),
+    updateMissing: boolean = true
+  ): Promise<Feature[]> {
     const features: Feature[] = [];
     const now = Math.floor(Date.now() / 1000);
     
@@ -688,9 +821,9 @@ export class DirectFeatureOrchestrator {
         subdirectories: subdirs.map(d => d.name)
       };
       
-      // Add features
-      features.push(
-        {
+      // Add features based on mode and existing features
+      if (this.shouldExtractFeature('directory.metadata', mode, existingFeatureKeys, updateMissing)) {
+        features.push({
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'directory.metadata',
@@ -704,8 +837,11 @@ export class DirectFeatureOrchestrator {
             fileCount: files.length,
             subdirectoryCount: subdirs.length
           }
-        },
-        {
+        });
+      }
+      
+      if (this.shouldExtractFeature('directory.file_count', mode, existingFeatureKeys, updateMissing)) {
+        features.push({
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'directory.file_count',
@@ -716,8 +852,11 @@ export class DirectFeatureOrchestrator {
           expiresAt: now + ttl,
           extractorTool: 'directory-extractor',
           metadata: {}
-        },
-        {
+        });
+      }
+      
+      if (this.shouldExtractFeature('directory.total_size', mode, existingFeatureKeys, updateMissing)) {
+        features.push({
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'directory.total_size',
@@ -728,8 +867,11 @@ export class DirectFeatureOrchestrator {
           expiresAt: now + ttl,
           extractorTool: 'directory-extractor',
           metadata: { formatted: this.formatFileSize(totalSize) }
-        },
-        {
+        });
+      }
+      
+      if (this.shouldExtractFeature('directory.subdirectory_count', mode, existingFeatureKeys, updateMissing)) {
+        features.push({
           id: uuidv4(),
           resourceUrl: resource.url,
           featureKey: 'directory.subdirectory_count',
@@ -740,8 +882,8 @@ export class DirectFeatureOrchestrator {
           expiresAt: now + ttl,
           extractorTool: 'directory-extractor',
           metadata: {}
-        }
-      );
+        });
+      }
       
       logger.info('Extracted directory features', {
         directory: dirPath,
@@ -782,6 +924,138 @@ export class DirectFeatureOrchestrator {
     }
     
     return extensions;
+  }
+
+  private shouldExtractFeature(
+    featureKey: string, 
+    mode: 'minimal' | 'standard' | 'maximal' = 'standard',
+    existingFeatureKeys: Set<string>,
+    updateMissing: boolean = true
+  ): boolean {
+    // If feature already exists and updateMissing is true, skip it
+    if (updateMissing && existingFeatureKeys.has(featureKey)) {
+      return false;
+    }
+    
+    // Define feature sets for each mode
+    const minimalFeatures = new Set([
+      'text.content',
+      'text.word_count',
+      'text.line_count',
+      'text.char_count',
+      'directory.metadata',
+      'directory.file_count',
+      'directory.total_size',
+      'directory.subdirectory_count'
+    ]);
+    
+    const standardFeatures = new Set([
+      ...minimalFeatures,
+      'image.thumbnail.small',
+      'image.thumbnail.medium',
+      'image.dimensions',
+      'image.format',
+      'video.dimensions',
+      'video.duration',
+      'video.snapshot_50',
+      'directory.subdirectory_count'
+    ]);
+    
+    // Maximal includes everything
+    if (mode === 'maximal') {
+      return true;
+    }
+    
+    // Check if feature is in the appropriate set
+    if (mode === 'minimal') {
+      return minimalFeatures.has(featureKey);
+    }
+    
+    // Standard mode
+    return standardFeatures.has(featureKey);
+  }
+
+  private async recursivelyExtractFromDirectory(
+    dirPath: string, 
+    options: ExtractOptions
+  ): Promise<string[]> {
+    const processedFiles: string[] = [];
+    
+    try {
+      const { readdir, stat } = await import('fs/promises');
+      const { join } = await import('path');
+      
+      const walkDirectory = async (currentPath: string): Promise<void> => {
+        try {
+          const entries = await readdir(currentPath, { withFileTypes: true });
+          
+          for (const entry of entries) {
+            const fullPath = join(currentPath, entry.name);
+            
+            // Skip hidden files and common ignore patterns
+            if (entry.name.startsWith('.') || 
+                entry.name === 'node_modules' || 
+                entry.name === '__pycache__' ||
+                entry.name === 'dist' ||
+                entry.name === 'build') {
+              logger.trace('Skipping ignored path', { path: fullPath });
+              continue;
+            }
+            
+            if (entry.isDirectory()) {
+              // Extract features for the subdirectory itself
+              try {
+                logger.debug('Extracting features for subdirectory', { path: fullPath });
+                const dirUrl = `file://${fullPath}`;
+                await this.extractFeatures(dirUrl, {
+                  ...options,
+                  skipDirectoryIndexing: true // Prevent infinite recursion
+                });
+                processedFiles.push(fullPath);
+              } catch (error) {
+                logger.error('Failed to extract directory features', error, { path: fullPath });
+              }
+              
+              // Then recursively process its contents
+              await walkDirectory(fullPath);
+            } else if (entry.isFile()) {
+              try {
+                // Check file size before processing
+                const stats = await stat(fullPath);
+                if (stats.size > 100 * 1024 * 1024) { // Skip files > 100MB
+                  logger.warn('Skipping large file', { 
+                    path: fullPath, 
+                    size: stats.size 
+                  });
+                  continue;
+                }
+                
+                // Extract features for the file
+                logger.debug('Extracting features for file', { path: fullPath });
+                const fileUrl = `file://${fullPath}`;
+                await this.extractFeatures(fileUrl, options);
+                processedFiles.push(fullPath);
+                
+              } catch (error) {
+                logger.error('Failed to process file', error, { path: fullPath });
+              }
+            }
+          }
+        } catch (error) {
+          logger.error('Failed to read directory', error, { path: currentPath });
+        }
+      }
+      
+      // Start the recursive walk
+      await walkDirectory(dirPath);
+      
+    } catch (error) {
+      logger.error('Failed to recursively extract from directory', error, {
+        directory: dirPath
+      });
+    }
+    
+    return processedFiles;
   }
 
   async *extractFeaturesStream(

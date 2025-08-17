@@ -62,6 +62,35 @@ export class FeatureDatabase {
     };
   }
 
+  async getResources(params?: { url?: string; type?: string }): Promise<Resource[]> {
+    let query = 'SELECT * FROM resources WHERE 1=1';
+    const bindings: any[] = [];
+    
+    if (params?.url) {
+      query += ' AND url = ?';
+      bindings.push(params.url);
+    }
+    
+    if (params?.type) {
+      query += ' AND type = ?';
+      bindings.push(params.type);
+    }
+    
+    const stmt = this.db.prepare(query);
+    const rows = stmt.all(...bindings) as any[];
+    
+    return rows.map(row => ({
+      url: row.url,
+      type: row.type as ResourceType,
+      lastProcessed: row.last_processed,
+      checksum: row.checksum,
+      size: row.size,
+      mimeType: row.mime_type,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }));
+  }
+
   // Feature operations
   async storeFeatures(resourceUrl: string, features: Array<{
     key: string;
